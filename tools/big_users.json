@@ -1,0 +1,7 @@
+{
+    "id": { "type": "serial" },
+    "name": { "type": "name", "first": ["Andy", "Bob", "Charley", "Dianna", "Elizabeth", "Frank", "Gina", "Harry", "Ivan", "Jill"], "last": ["Smith", "Johnson", "Williams", "Jones", "Brown", "Davis", "Miller", "Wilson", "Moore", "Taylor"] },
+    "age": { "type": "int", "min": 18, "max": 24 },
+    "joined": { "type": "datetime", "min": "2018-01-01", "max": "2022-01-01" },
+    "last_active": { "type": "datetime", "min": "2020-01-01", "max": "2022-01-01" }
+}

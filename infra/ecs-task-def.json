@@ -1,0 +1,36 @@
+{
+    "family": "flask-api-server",
+    "networkMode": "awsvpc",
+    "containerDefinitions": [
+        {
+            "name": "flask-api-container",
+            "image": "your-docker-image:latest",
+            "cpu": 256,
+            "memory": 512,
+            "essential": true,
+            "portMappings": [
+                {
+                    "containerPort": 5433,
+                    "hostPort": 5433,
+                    "protocol": "tcp"
+                }
+            ],
+            "environment": [],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/flask-api-server",
+                    "awslogs-region": "us-east-1",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            }
+        }
+    ],
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "256",
+    "memory": "512",
+    "executionRoleArn": "arn:aws:iam::your-account-id:role/ecsTaskExecutionRole",
+    "taskRoleArn": "arn:aws:iam::your-account-id:role/ecsTaskRole"
+}
