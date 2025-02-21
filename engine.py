@@ -12,6 +12,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExec
 class MiniPGEngine:
     """Core DB Engine class
     """
+    supported_functions = {
+        'SUM(*)': lambda x: sum(x),
+        'COUNT(*)': lambda x: len(x),
+        'AVG(*)': lambda x: sum(x) / len(x),
+        'MAX(*)': lambda x: max(x),
+        'MIN(*)': lambda x: min(x)
+    }
     def __init__(self, data_dir = "./data", config = {}):
         self.data_dir = data_dir
         # ---- Setup Global Data ----
@@ -43,7 +50,7 @@ class MiniPGEngine:
         return self
     
     def __exit__(self, exc_type, exc_value, traceback):
-        print("Shutting down MiniPG Engine")
+        print(f"Shutting down MiniPG Engine: {exc_type}, {exc_value}")
         self.worker_pool.shutdown()
         # Flush Caches
         self._json_file_update_entries(f"{self.data_dir}/global/mpg_sequences.json", self._sequence_cache)
@@ -103,12 +110,6 @@ class MiniPGEngine:
         :param column_prefix: prefix for column names
         :return: generator to yield rows from the table
         """
-        if not order_by:
-            sort_dir, sort_col = None, None
-        else:
-            sort_args = order_by.split()
-            sort_col, sort_dir = sort_args[0], sort_args[1] if len(sort_args) > 1 else (sort_args[0], None)
-
         if not order_by or order_by == table_info['sort']:
             with open(table_path, 'r') as table_file:
                 for line in table_file:
@@ -119,6 +120,9 @@ class MiniPGEngine:
                         yield json.loads(line)
         else:
             # ---- Sort ----
+            sort_args = order_by[0].split(" ")
+            sort_col, sort_dir = sort_args[0], sort_args[1] if len(sort_args) > 1 else (sort_args[0], None)
+            # ---- Read and Sort ----
             with open(table_path, 'r') as table_file:
                 rows = [json.loads(line) for line in table_file]
             rows.sort(key=lambda x: x[sort_col], reverse=sort_dir == 'DESC')
@@ -144,7 +148,7 @@ class MiniPGEngine:
         return (f"Inserted {len(insert_plan['values'])} records into table '{table_name}'", [])
 
     def _execute_select(self, execution_plan):
-        """Basic execution of a SELECT query
+        """Basic unoptimized execution logic for a SELECT query
         1. Validate table and columns
         2. Load the 'from' table into memory
         3. Apply joins 
@@ -157,41 +161,75 @@ class MiniPGEngine:
         6. Apply LIMIT
         7. Return results
         """
-        # ---- Validate Table and Columns ----
-        table_name = execution_plan['from']
-        table_info = json.load(open(f"{self.data_dir}/global/mpg_tables.json", 'r')).get(table_name)
-        if not table_info:
-            return f"Error: Table '{table_name}' not found in catalog"
+        # ---- Validate Tables and Columns ----
+        table_mds = {}
+        for table in [execution_plan['from']] + list(execution_plan.get('joins', {}).keys()):
+            table_info = json.load(open(f"{self.data_dir}/global/mpg_tables.json", 'r')).get(table)
+            if not table_info:
+                return f"Error: Table '{table}' not found in catalog"
+            table_mds[table] = table_info
+        # ---- Validate Columns or Functions ----
         select_cols = execution_plan['select']
-        if select_cols != ["*"]:
-            for col in select_cols:
-                if col not in table_info['columns']:
-                    return f"Error: Column '{col}' not found in table '{table_name}'"
-        table_path = f"{self.data_dir}/json_db/{table_name}.jsonl"
+        for col in select_cols:
+            if '.' in col:
+                table, col_name = col.split('.')
+                if col_name != "*" and col_name not in table_mds[table]['columns'] and col_name not in self.supported_functions:
+                    return f"Error: Column '{col_name}' not found in table '{table}'"
+            else:
+                for table_info in table_mds.values():
+                    if col != "*" and col not in table_info['columns'] and col not in self.supported_functions:
+                        return f"Error: Column '{col}' not found in any table"
+
         results = []
         # ---- Base Table Scan ----
+        table_name = execution_plan['from']
+        table_path = f"{self.data_dir}/json_db/{table_name}.jsonl"
         base_results = []
-        column_prefix = table_name if len(execution_plan.get('joins', {})) > 0 else None
-        for row in self._file_scan(table_path, table_info, execution_plan.get('order_by'), column_prefix):
+        column_prefix = execution_plan['from'] if len(execution_plan.get('joins', {})) > 0 else None
+        for row in self._file_scan(table_path, table_mds[execution_plan['from']], execution_plan.get('order_by'), column_prefix):
             base_results.append(row)
-        print(f"Base Results: {base_results[:10]}")
 
         # ---- Handle Joins ----
         if execution_plan.get('joins'):
             for join_table, join_info in execution_plan['joins'].items():
+                ## Validate Joined Table
                 join_table_info = json.load(open(f"{self.data_dir}/global/mpg_tables.json", 'r')).get(join_table)
                 if not join_table_info:
                     return f"Error: Join Table '{join_table}' not found in catalog"
                 join_table_path = f"{self.data_dir}/json_db/{join_table}.jsonl"
+                ## Load Join Table Into Memory
                 join_results = []
                 for row in self._file_scan(join_table_path, join_table_info, execution_plan.get('order_by'), join_table):
                     join_results.append(row)
+                ## Perform Join
+                left_join_cnd, right_join_cnd = join_info['on'].split()[0], join_info['on'].split()[2]
                 for row in base_results:
                     for join_row in join_results:
-                        if row[join_info['on'].split()[0]] == join_row[join_info['on'].split()[2]]:
-                            # print(f"Matched: {row}, {join_row}")
+                        if row[left_join_cnd] == join_row[right_join_cnd]:
                             row.update(join_row)
-        print(f"Base Results: {base_results[:10]}")
+        # ---- Handle Grouping ----
+        if execution_plan['group_by']:
+            grouped_results = {}
+            for row in base_results:
+                key = tuple(row[col] for col in execution_plan['group_by'])
+                if key not in grouped_results:
+                    grouped_results[key] = []
+                grouped_results[key].append(row)
+            print(f"Grouped Results: {grouped_results}")
+            # Apply Aggregate Functions
+            results = []
+            for group_keys, group_rows in grouped_results.items():
+                row = {}
+                for (key, val) in zip(execution_plan['group_by'], group_keys):
+                    row[key] = val
+                for col in select_cols:
+                    if col in self.supported_functions:
+                        row[col] = self.supported_functions[col](group_rows)
+                    else:
+                        row[col] = group_rows[0][col]
+                results.append(row)
+            base_results = results
+        print(base_results[:10])
         # ---- Row Level Filtering ----
         results = []
         for row in base_results:
@@ -202,7 +240,17 @@ class MiniPGEngine:
             if select_cols == ['*']:
                 results.append(row)
             else:
-                results.append({col: row[col] for col in select_cols})
+                row_record = {}
+                for col in select_cols:
+                    if '.' in col:
+                        table, col_name = col.split('.')
+                        if col_name == "*":
+                            row_record.update({col: row[col] for col in row.keys() if col.startswith(f"{table}.")})
+                        else:
+                            row_record[col] = row[f"{table}.{col_name}"]
+                    else:
+                        row_record[col] = row[col]
+                results.append(row_record)
             # ---- Limiting ----
             if execution_plan["limit"] and len(results) >= execution_plan["limit"]:
                 break
@@ -534,7 +582,11 @@ def cli():
     with MiniPGEngine() as engine:
         if len(sys.argv) > 1:
             print(f"Running query: {sys.argv[1]}")
-            print(engine.run_query(sys.argv[1]))
+            msg, res = engine.run_query(sys.argv[1])
+            print("========RESULTS========")
+            for r in res:
+                print(json.dumps(r))
+            print(msg)
         else:
             histfile = os.path.join(os.path.expanduser("~"), ".mpg_history")
             try:
@@ -545,6 +597,7 @@ def cli():
             user_query = input("Enter a query [or exit (\q)]: ")
             while user_query != '\q':
                 msg, res = (engine.run_query(user_query))
+                print("========RESULTS========")
                 for r in res:
                     print(json.dumps(r))
                 print(msg)
