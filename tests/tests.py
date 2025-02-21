@@ -1,4 +1,3 @@
-import pytest
 from engine import QueryPlanner
 import sqlparse
 
@@ -20,7 +19,7 @@ class TestGenerateSelectPlan:
         }
         assert QueryPlanner._generate_select_plan(get_tokens(query)) == expected_plan
 
-    def test_generate_select_plan_with_conditions(self):
+    def test_generate_select_plan_with_where(self):
         query = "SELECT * FROM table WHERE table.id = 1"
         expected_plan = {
             'command': 'SELECT',

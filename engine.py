@@ -95,11 +95,13 @@ class MiniPGEngine:
             self._seq_cache_hits = 0
         return self._sequence_cache[sequence_name]
 
-    def _file_scan(self, table_path, table_info, order_by=None):
+    def _file_scan(self, table_path, table_info, order_by=None, column_prefix=None):
         """Get a generator to return rows from a table
         :param table_path: path to the table file
         :param table_info: table metadata
         :param order_by: ORDER BY clause
+        :param column_prefix: prefix for column names
+        :return: generator to yield rows from the table
         """
         if not order_by:
             sort_dir, sort_col = None, None
@@ -110,14 +112,21 @@ class MiniPGEngine:
         if not order_by or order_by == table_info['sort']:
             with open(table_path, 'r') as table_file:
                 for line in table_file:
-                    yield json.loads(line)
+                    if column_prefix:
+                        row = json.loads(line)
+                        yield {f"{column_prefix}.{col}": row[col] for col in table_info['columns']}
+                    else:
+                        yield json.loads(line)
         else:
             # ---- Sort ----
             with open(table_path, 'r') as table_file:
                 rows = [json.loads(line) for line in table_file]
             rows.sort(key=lambda x: x[sort_col], reverse=sort_dir == 'DESC')
             for row in rows:
-                yield row
+                if column_prefix:
+                    yield {f"{column_prefix}.{col}": row[col] for col in table_info['columns']}
+                else:
+                    yield row
             
     def _execute_insert(self, insert_plan):
         """
@@ -135,7 +144,18 @@ class MiniPGEngine:
         return (f"Inserted {len(insert_plan['values'])} records into table '{table_name}'", [])
 
     def _execute_select(self, execution_plan):
-        """
+        """Basic execution of a SELECT query
+        1. Validate table and columns
+        2. Load the 'from' table into memory
+        3. Apply joins 
+            a. Load join table into memory with columns as {join_table.column_name}
+            b. Turn 'from' columns into {from_table.column_name}
+            c. Perform join on 'from_table.column_name' = 'join_table.column_name'
+            d. Add join columns to 'from' table
+        4. Apply WHERE clause
+        5. Apply ORDER BY
+        6. Apply LIMIT
+        7. Return results
         """
         # ---- Validate Table and Columns ----
         table_name = execution_plan['from']
@@ -149,9 +169,32 @@ class MiniPGEngine:
                     return f"Error: Column '{col}' not found in table '{table_name}'"
         table_path = f"{self.data_dir}/json_db/{table_name}.jsonl"
         results = []
-        # ---- File Scan ----
-        for row in self._file_scan(table_path, table_info, execution_plan.get('order_by')):
-            # ---- Row Level Filtering ----
+        # ---- Base Table Scan ----
+        base_results = []
+        column_prefix = table_name if len(execution_plan.get('joins', {})) > 0 else None
+        for row in self._file_scan(table_path, table_info, execution_plan.get('order_by'), column_prefix):
+            base_results.append(row)
+        print(f"Base Results: {base_results[:10]}")
+
+        # ---- Handle Joins ----
+        if execution_plan.get('joins'):
+            for join_table, join_info in execution_plan['joins'].items():
+                join_table_info = json.load(open(f"{self.data_dir}/global/mpg_tables.json", 'r')).get(join_table)
+                if not join_table_info:
+                    return f"Error: Join Table '{join_table}' not found in catalog"
+                join_table_path = f"{self.data_dir}/json_db/{join_table}.jsonl"
+                join_results = []
+                for row in self._file_scan(join_table_path, join_table_info, execution_plan.get('order_by'), join_table):
+                    join_results.append(row)
+                for row in base_results:
+                    for join_row in join_results:
+                        if row[join_info['on'].split()[0]] == join_row[join_info['on'].split()[2]]:
+                            # print(f"Matched: {row}, {join_row}")
+                            row.update(join_row)
+        print(f"Base Results: {base_results[:10]}")
+        # ---- Row Level Filtering ----
+        results = []
+        for row in base_results:
             if execution_plan["where"]:
                 if not self._evaluate_where(row, execution_plan["where"]):
                     continue
@@ -167,6 +210,8 @@ class MiniPGEngine:
     
     def _evaluate_where(self, row, where_clause):
         """Handle <, >, =, AND, OR, NOT operators
+        Example: users.age = 23 AND users.name = 'Alice' OR users.city = 'New York'
+        Returns: True or False
         """
         def evaluate_expression(expression):
             if ' AND ' in expression:
@@ -175,7 +220,7 @@ class MiniPGEngine:
                 return any(evaluate_expression(e.strip()) for e in expression.split(' OR '))
             if expression.startswith('NOT '):
                 return not evaluate_expression(expression[4:].strip())
-            match = re.match(r'(\w+)\s*(=|<|>|<=|>=|!=)\s*(.+)', expression)
+            match = re.match(r'(.+?)\s*(=|<|>|<=|>=|!=)\s*(.+)', expression)
             if not match:
                 raise ValueError(f"Invalid expression: {expression}")
             left, operator, right = match.groups()
