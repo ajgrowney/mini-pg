@@ -1,0 +1,7 @@
+{
+    "python.testing.pytestArgs": [
+        "/Users/andrewgrowney/Code/Dbs/mini-pg/tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
+}

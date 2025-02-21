@@ -5,7 +5,7 @@ import json
 import os
 import re
 import sqlparse
-from sqlparse.sql import IdentifierList, Identifier, Where, Function, Values
+from sqlparse.sql import IdentifierList, Identifier, Where, Function, Values, Comparison, TokenList
 from sqlparse.tokens import Keyword, DML, Whitespace, Literal, Wildcard
 from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 
@@ -16,9 +16,10 @@ class MiniPGEngine:
         self.data_dir = data_dir
         # ---- Setup Global Data ----
         os.makedirs(self.data_dir, exist_ok=True)
-        os.makedirs(f"{self.data_dir}/json_db", exist_ok=True) # per-database subdirectories
         os.makedirs(f"{self.data_dir}/global", exist_ok=True) # cluster-wide tables (e.g. mpg_tables, mpg_sequences)
         os.makedirs(f"{self.data_dir}/mpg_stat", exist_ok=True) # permanent files for the statistics subsystem
+        # per-database subdirectories
+        os.makedirs(f"{self.data_dir}/json_db", exist_ok=True) 
         # ---- Initialize Global Data ----
         table_catalog = f"{self.data_dir}/global/mpg_tables.json"
         if not os.path.exists(table_catalog):
@@ -44,6 +45,7 @@ class MiniPGEngine:
     def __exit__(self, exc_type, exc_value, traceback):
         print("Shutting down MiniPG Engine")
         self.worker_pool.shutdown()
+        # Flush Caches
         self._json_file_update_entries(f"{self.data_dir}/global/mpg_sequences.json", self._sequence_cache)
 
     def _json_file_update_entries(self, file_path, data_dict):
@@ -59,18 +61,18 @@ class MiniPGEngine:
         :return: tuple of status message and op
         tional result set
         """
-        parsed_query = sqlparse.parse(query)[0]
-        query_type = parsed_query.get_type()
+        query_tokens = sqlparse.parse(query)[0]
+        query_type = query_tokens.get_type()
         if query_type == 'SELECT':
-            select_plan = QueryParser._parse_select_query(parsed_query)
+            select_plan = QueryPlanner._generate_select_plan(query_tokens)
             results = self._execute_select(select_plan)
             return (f"Query OK, {len(results)} rows returned", results)
         elif query_type == 'CREATE':
-            ct_plan = QueryParser._parse_create_table_query(query)
+            ct_plan = QueryPlanner._generate_create_table_plan(query)
             print(f"[create_table] Plan: {ct_plan}")
             return self._execute_create_table(ct_plan)
         elif query_type == 'INSERT':
-            insert_plan = QueryParser._parse_insert_query(parsed_query)
+            insert_plan = QueryPlanner._generate_insert_plan(query_tokens)
             print(f"[insert] Plan: {insert_plan}")
             return self._execute_insert(insert_plan)
         else:
@@ -223,83 +225,106 @@ class MiniPGEngine:
         self.stats_manager.update_table_stats(table_name)
         return f"Table '{table_name}' created successfully"
 
-class QueryParser:
-    """Basic SQL query parser
+class QueryPlanner:
+    """Build a query plan from a parsed SQL query
     """
     def __init__(self):
         pass
 
     @classmethod
-    def parse(cls, query) -> dict:
-        query = query.strip()
-        command = cls._parse_command(query)
-        if command == 'SELECT':
-            return cls._parse_select_query(query)
-        elif command == 'CREATE TABLE':
-            return cls._parse_create_table_query(query)
-        elif command == 'INSERT':
-            return cls._parse_insert_query(query)
-        else:
-            return {'error': f'Unsupported command: {command} [ Supported: SELECT, CREATE TABLE ]'}
-    
-    @classmethod
-    def _parse_command(cls, query):
-        pos = query.find(' ')
-        cmd = query[:pos].upper()
-        if cmd in { "ALTER", "CREATE", "DROP" }:
-            if query[pos+1:pos+6].upper() == "TABLE":
-                return f"{cmd} TABLE"
-            else:
-                raise Exception(f"Error: Unsupported {cmd} command")
-        return cmd
-    
-
-    @classmethod
-    def _parse_select_query(cls, parsed_tokens):
+    def _generate_select_plan(cls, parsed_tokens):
         """Extract a query plan from a SELECT query
+        Example: SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id WHERE users.name = 'Alice' ORDER BY orders.created_at DESC LIMIT 10
+        Output: {
+            'select': ['*'],
+            'from': 'users',
+            'joins': { 'orders': { 'type': 'INNER', 'on': 'users.id = orders.user_id' } },
+            'where': 'users.name = Alice',
+            'group_by': None,
+            'order_by': ['orders.created_at DESC'],
+            'limit': 10
+        }
         """
         parsed_query = {
             'command': 'SELECT',
             'select': [],
             'from': None,
+            'joins': {},
             'where': None,
-            'order_by': [],
+            'order_by': None,
+            'group_by': None,
             'limit': None
         }
-        cur_keyword = None
+        state = 'START'
+        join_type, join_table = None, None
         for token in parsed_tokens.tokens:
-            if token.ttype is DML and token.value.upper() == 'SELECT':
-                cur_keyword = 'select'
-            elif token.ttype is Keyword:
-                if token.value.upper() == 'FROM':
-                    cur_keyword = 'from'
-                elif token.value.upper() == 'ORDER BY':
-                    cur_keyword = 'order_by'
-                elif token.value.upper() == 'LIMIT':
-                    cur_keyword = 'limit'
-            elif token.ttype is Wildcard:
-                parsed_query['select'].append(str(token))
-            elif isinstance(token, Where):
-                cur_keyword = 'where'
-                parsed_query['where'] = str(token)[6:].strip()
-            elif isinstance(token, IdentifierList):
-                if cur_keyword == 'select':
+            if token.ttype is Whitespace:
+                continue
+            if state == 'START':
+                if token.ttype is DML and token.value.upper() == 'SELECT':
+                    state = 'SELECT'
+            elif state == 'SELECT':
+                if token.ttype is Keyword and token.value.upper() == 'FROM':
+                    state = 'FROM'
+                elif isinstance(token, IdentifierList):
                     parsed_query['select'] = [str(identifier) for identifier in token.get_identifiers()]
+                elif isinstance(token, Identifier) or token.ttype is Wildcard:
+                    parsed_query['select'].append(str(token))
+            elif state == 'FROM':
+                if token.ttype is Keyword or isinstance(token, Identifier):
+                    state = 'JOIN_OR_WHERE'
+                    parsed_query['from'] = str(token)
                 else:
-                    print(f"Unresolved: {token} for {cur_keyword}")
-            elif isinstance(token, Identifier):
-                parsed_query[cur_keyword] = str(token)
-            elif token.ttype is Literal.Number.Integer:
-                if cur_keyword == 'limit':
+                    print(f"[{state}] Unresolved: {token} {type(token)}, {token.ttype}")
+            elif state == 'JOIN_OR_WHERE':
+                if token.ttype is Keyword and token.value.upper() in {'JOIN', 'INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN'}:
+                    state = 'JOIN'
+                    join_type = token.value.upper()
+                elif isinstance(token, Where):
+                    state = 'WHERE'
+                    parsed_query['where'] = str(token)[6:].strip()
+                elif token.ttype is Keyword and token.value.upper() == 'ORDER BY':
+                    state = 'ORDER_BY'
+                elif token.ttype is Keyword and token.value.upper() == 'GROUP BY':
+                    state = 'GROUP_BY'
+                elif token.ttype is Keyword and token.value.upper() == 'LIMIT':
+                    state = 'LIMIT'
+                else:
+                    print(f"[{state}] Unresolved: {token} {type(token)}, {token.ttype}")
+            elif state == 'JOIN':
+                if isinstance(token, Identifier):
+                    join_table = str(token)
+                    state = 'ON'
+            elif state == 'ON':
+                if isinstance(token, Comparison):
+                    parsed_query['joins'][join_table] = { 'type': join_type, 'on': str(token) }
+                    state = 'JOIN_OR_WHERE'
+                    join_table, join_type = None, None
+            elif state == 'WHERE':
+                if isinstance(token, Where):
+                    parsed_query['where'] = str(token)[6:].strip()
+                    state = 'JOIN_OR_WHERE'
+            elif state == 'ORDER_BY':
+                if isinstance(token, IdentifierList):
+                    parsed_query['order_by'] = [str(identifier) for identifier in token.get_identifiers()]
+                elif isinstance(token, Identifier):
+                    parsed_query['order_by'] = parsed_query['order_by'] + [str(token)] if parsed_query['order_by'] else [str(token)]
+                state = 'JOIN_OR_WHERE'
+            elif state == 'GROUP_BY':
+                if isinstance(token, IdentifierList):
+                    parsed_query['group_by'] = [str(identifier) for identifier in token.get_identifiers()]
+                elif token.ttype is Keyword or isinstance(token, Identifier):
+                    parsed_query['group_by'] = parsed_query['group_by'] + [str(token)] if parsed_query['group_by'] else [str(token)]
+                state = 'JOIN_OR_WHERE'
+            elif state == 'LIMIT':
+                if token.ttype is Literal.Number.Integer:
                     parsed_query['limit'] = int(token.value)
-                else:
-                    print(f"Unresolved: {token} for {cur_keyword}")
-            elif token.ttype is not Whitespace:
-                print("Unresolved:", (token, type(token), token.ttype))
+                state = 'JOIN_OR_WHERE'
+        print(f"Generated Plan: {parsed_query}")
         return parsed_query
 
     @classmethod
-    def _parse_create_table_query(cls, query):
+    def _generate_create_table_plan(cls, query):
         parsed_query = {
             'command': 'CREATE TABLE',
             'table': None,
@@ -316,7 +341,7 @@ class QueryParser:
         return parsed_query
 
     @classmethod
-    def _parse_insert_query(cls, parsed_tokens):
+    def _generate_insert_plan(cls, parsed_tokens):
         """INSERT INTO table_name (col1, col2, ...) VALUES (val1, val2, ...)
         """
         parsed_query = {
@@ -483,3 +508,6 @@ def cli():
 
 if __name__ == '__main__':
     cli()
+    # query = "SELECT * FROM users JOIN orders ON users.id = orders.user_id WHERE users.name = 'Alice' ORDER BY orders.created_at DESC LIMIT 10"
+    # parsed_query = sqlparse.parse(query)[0]
+    # query_type = parsed_query.get_type()
