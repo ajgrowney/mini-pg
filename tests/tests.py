@@ -23,6 +23,19 @@ class TestGenerateSelectPlan:
         }
         assert QueryPlanner._generate_select_plan(get_tokens(query)) == expected_plan
 
+    def test_generate_select_plan_with_function(self):
+        query = "SELECT COUNT(*) FROM table"
+        expected_plan = {
+            'command': 'SELECT',
+            'select': ['COUNT(*)'],
+            'from': 'table',
+            'joins': {},
+            'where': None,
+            'order_by': None,
+            'group_by': None,
+            'limit': None
+        }
+        assert QueryPlanner._generate_select_plan(get_tokens(query)) == expected_plan
     def test_generate_select_plan_with_where(self):
         query = "SELECT * FROM table WHERE table.id = 1"
         expected_plan = {
@@ -80,6 +93,20 @@ class TestGenerateSelectPlan:
             'from': 'table',
             'joins': {},
             'where': None,
+            'order_by': None,
+            'group_by': ['column'],
+            'limit': None
+        }
+        assert QueryPlanner._generate_select_plan(get_tokens(query)) == expected_plan
+    
+    def test_generate_select_plan_with_group_by_and_where(self):
+        query = "SELECT column, COUNT(*) FROM table WHERE id > 10 GROUP BY column"
+        expected_plan = {
+            'command': 'SELECT',
+            'select': ['column', 'COUNT(*)'],
+            'from': 'table',
+            'joins': {},
+            'where': 'id > 10',
             'order_by': None,
             'group_by': ['column'],
             'limit': None
@@ -172,6 +199,16 @@ class TestMiniPGEngine:
         assert msg == "Query OK, 2 rows returned"
         assert result == expected_result
 
+    def test_execute_select_with_group_by_where(self, test_engine, test_small_user_table):
+        query = "SELECT name, COUNT(*) FROM users WHERE age > 50 GROUP BY name"
+        expected_result = [
+            {'name': 'Jane', 'COUNT(*)': 1}
+        ]
+    
+        msg, result = test_engine.run_query(query)
+        assert msg == "Query OK, 1 rows returned"
+        assert result == expected_result
+
     def test_execute_select_with_limit(self, test_engine, test_small_user_table):
         query = "SELECT * FROM users LIMIT 1"
         expected_result = [{'id': 1, 'name': 'John', 'age': 50}]
@@ -179,3 +216,11 @@ class TestMiniPGEngine:
         msg, result = test_engine.run_query(query)
         assert msg == "Query OK, 1 rows returned"
         assert result == expected_result
+
+    def test_execute_select_count(self, test_engine, test_small_user_table):
+        query = "SELECT COUNT(*) FROM users"
+        expected_result = [{'COUNT(*)': 2}]
+        
+        msg, result = test_engine.run_query(query)
+        assert result == expected_result
+        assert msg == "Query OK, 1 rows returned"

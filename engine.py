@@ -19,6 +19,11 @@ class MiniPGEngine:
         'MAX(*)': lambda x: max(x),
         'MIN(*)': lambda x: min(x)
     }
+    meta_tables = {
+        'mpg_tables': {
+            'keys': ['table_name', 'columns', 'sort']
+        }
+    }
     def __init__(self, data_dir = "./data", config = {}):
         self.data_dir = data_dir
         # ---- Setup Global Data ----
@@ -77,11 +82,15 @@ class MiniPGEngine:
         elif query_type == 'CREATE':
             ct_plan = QueryPlanner._generate_create_table_plan(query)
             print(f"[create_table] Plan: {ct_plan}")
-            return self._execute_create_table(ct_plan)
+            return (self._execute_create_table(ct_plan), None)
         elif query_type == 'INSERT':
             insert_plan = QueryPlanner._generate_insert_plan(query_tokens)
             print(f"[insert] Plan: {insert_plan}")
             return self._execute_insert(insert_plan)
+        elif query == 'SHOW TABLES':
+            with open(f"{self.data_dir}/global/mpg_tables.json", 'r') as table_file:
+                table_catalog = json.load(table_file)
+            return (f"Query OK, {len(table_catalog)} tables found", list(table_catalog.keys()))
         else:
             return (f"Error: Unsupported query type: {query_type}", None)
 
@@ -140,6 +149,8 @@ class MiniPGEngine:
         if not table_info:
             return f"Error: Table '{table_name}' not found in catalog"
         table_path = f"{self.data_dir}/json_db/{table_name}.jsonl"
+        if table_info['sort'] != 'id ASC':
+            return f"Error: Table '{table_name}' is not append-only"
         with open(table_path, 'a') as table_file:
             for record in insert_plan['values']:
                 record_id = self.get_sequence_nextval(f"{table_name}_id_seq")
@@ -169,17 +180,23 @@ class MiniPGEngine:
                 return f"Error: Table '{table}' not found in catalog"
             table_mds[table] = table_info
         # ---- Validate Columns or Functions ----
+        is_agg = False
         select_cols = execution_plan['select']
         for col in select_cols:
             if '.' in col:
                 table, col_name = col.split('.')
                 if col_name != "*" and col_name not in table_mds[table]['columns'] and col_name not in self.supported_functions:
                     return f"Error: Column '{col_name}' not found in table '{table}'"
+            elif col in self.supported_functions:
+                is_agg = True
             else:
                 for table_info in table_mds.values():
                     if col != "*" and col not in table_info['columns'] and col not in self.supported_functions:
                         return f"Error: Column '{col}' not found in any table"
-
+        if is_agg:
+            if not execution_plan["group_by"] or len(execution_plan['group_by']) == 0:
+                if len(select_cols) > 1:
+                    return "Error: Aggregate functions require a GROUP BY clause"
         results = []
         # ---- Base Table Scan ----
         table_name = execution_plan['from']
@@ -215,45 +232,56 @@ class MiniPGEngine:
                 if key not in grouped_results:
                     grouped_results[key] = []
                 grouped_results[key].append(row)
-            print(f"Grouped Results: {grouped_results}")
             # Apply Aggregate Functions
-            results = []
+            agg_results = []
             for group_keys, group_rows in grouped_results.items():
                 row = {}
-                for (key, val) in zip(execution_plan['group_by'], group_keys):
-                    row[key] = val
-                for col in select_cols:
-                    if col in self.supported_functions:
-                        row[col] = self.supported_functions[col](group_rows)
-                    else:
-                        row[col] = group_rows[0][col]
-                results.append(row)
-            base_results = results
-        print(base_results[:10])
+                if execution_plan["where"]:
+                    filtered_rows = []
+                    for row in group_rows:
+                        if not self._evaluate_where(row, execution_plan["where"]):
+                            continue
+                        filtered_rows.append(row)
+                    group_rows = filtered_rows
+                if len(group_rows) > 0:
+                    for (key, val) in zip(execution_plan['group_by'], group_keys):
+                        row[key] = val
+                    for col in select_cols:
+                        if col in self.supported_functions:
+                            row[col] = self.supported_functions[col](group_rows)
+                        else:
+                            row[col] = group_rows[0][col]
+                    agg_results.append(row)
+            base_results = agg_results
         # ---- Row Level Filtering ----
         results = []
-        for row in base_results:
-            if execution_plan["where"]:
-                if not self._evaluate_where(row, execution_plan["where"]):
-                    continue
-            # ---- Projection ----
-            if select_cols == ['*']:
-                results.append(row)
-            else:
-                row_record = {}
-                for col in select_cols:
-                    if '.' in col:
-                        table, col_name = col.split('.')
-                        if col_name == "*":
-                            row_record.update({col: row[col] for col in row.keys() if col.startswith(f"{table}.")})
+        if is_agg and not execution_plan["group_by"]:
+            # Apply Aggregate Functions on Ungrouped Data
+            for select_func in select_cols:
+                results.append({select_func: self.supported_functions[select_func](base_results)})
+        else:
+            for row in base_results:
+                if execution_plan["where"] and not execution_plan["group_by"]:
+                    if not self._evaluate_where(row, execution_plan["where"]):
+                        continue
+                # ---- Projection ----
+                if select_cols == ['*']:
+                    results.append(row)
+                else:
+                    row_record = {}
+                    for col in select_cols:
+                        if '.' in col:
+                            table, col_name = col.split('.')
+                            if col_name == "*":
+                                row_record.update({col: row[col] for col in row.keys() if col.startswith(f"{table}.")})
+                            else:
+                                row_record[col] = row[f"{table}.{col_name}"]
                         else:
-                            row_record[col] = row[f"{table}.{col_name}"]
-                    else:
-                        row_record[col] = row[col]
-                results.append(row_record)
-            # ---- Limiting ----
-            if execution_plan["limit"] and len(results) >= execution_plan["limit"]:
-                break
+                            row_record[col] = row[col]
+                    results.append(row_record)
+                # ---- Limiting ----
+                if execution_plan["limit"] and len(results) >= execution_plan["limit"]:
+                    break
         return results
     
     def _evaluate_where(self, row, where_clause):
@@ -300,15 +328,14 @@ class MiniPGEngine:
     def _execute_create_table(self, table_request):
         """
         """
-        print(table_request)
         table_name = table_request['table']
-        table_columns = { c.split()[0]: c.split()[1] for c  in table_request['columns'].split(",")}
+        table_columns = table_request['columns']
         table_catalog = json.load(open(f"{self.data_dir}/global/mpg_tables.json", 'r'))
         if table_name in table_catalog:
             return f"Error: Table '{table_name}' already exists"
         table_catalog[table_name] = {
             'columns': table_columns,
-            'sort': None
+            'sort': 'id ASC'
         }
         with open(f"{self.data_dir}/global/mpg_tables.json", 'w') as table_file:
             json.dump(table_catalog, table_file)
@@ -316,7 +343,7 @@ class MiniPGEngine:
         with open(table_path, 'w') as table_file:
             pass
         self.stats_manager.update_table_stats(table_name)
-        return f"Table '{table_name}' created successfully"
+        return "Table '{table_name}' created successfully"
 
 class QueryPlanner:
     """Build a query plan from a parsed SQL query
@@ -351,17 +378,21 @@ class QueryPlanner:
         state = 'START'
         join_type, join_table = None, None
         for token in parsed_tokens.tokens:
+            print(f"[{state}] Token: {token} {type(token)}, {token.ttype}")
             if token.ttype is Whitespace:
                 continue
             if state == 'START':
                 if token.ttype is DML and token.value.upper() == 'SELECT':
                     state = 'SELECT'
             elif state == 'SELECT':
+                print(f"DEBUG SELECT {token} {type(token)}, {token.ttype}")
                 if token.ttype is Keyword and token.value.upper() == 'FROM':
                     state = 'FROM'
                 elif isinstance(token, IdentifierList):
                     parsed_query['select'] = [str(identifier) for identifier in token.get_identifiers()]
                 elif isinstance(token, Identifier) or token.ttype is Wildcard:
+                    parsed_query['select'].append(str(token))
+                elif isinstance(token, Function):
                     parsed_query['select'].append(str(token))
             elif state == 'FROM':
                 if token.ttype is Keyword or isinstance(token, Identifier):
@@ -374,7 +405,6 @@ class QueryPlanner:
                     state = 'JOIN'
                     join_type = token.value.upper()
                 elif isinstance(token, Where):
-                    state = 'WHERE'
                     parsed_query['where'] = str(token)[6:].strip()
                 elif token.ttype is Keyword and token.value.upper() == 'ORDER BY':
                     state = 'ORDER_BY'
@@ -430,7 +460,8 @@ class QueryPlanner:
         columns_match = re.search(r'\((.+)\)', query, re.IGNORECASE)
         if not columns_match:
             raise Exception("Error: Invalid CREATE TABLE query: Columns not found")
-        parsed_query['columns'] = columns_match.group(1).strip()
+        
+        parsed_query['columns'] = { c[0]: c[1] for c in [col.split(" ") for col in columns_match.group(1).strip().split(', ')] }
         return parsed_query
 
     @classmethod
@@ -583,9 +614,10 @@ def cli():
         if len(sys.argv) > 1:
             print(f"Running query: {sys.argv[1]}")
             msg, res = engine.run_query(sys.argv[1])
-            print("========RESULTS========")
-            for r in res:
-                print(json.dumps(r))
+            if res:
+                print("========RESULTS========")
+                for r in res:
+                    print(json.dumps(r))
             print(msg)
         else:
             histfile = os.path.join(os.path.expanduser("~"), ".mpg_history")
